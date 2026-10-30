@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RENFE LIVE · Trenes en tiempo real</title>
+
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- ============================================================
+       Barra superior. En escritorio es una fila (marca, buscador,
+       estadísticas, estado, acciones); en móvil se reorganiza en
+       varias filas mediante CSS (ver style.css).
+       ============================================================ -->
+  <header class="panel">
+    <div class="panel__brand">
+      <span class="panel__dot" id="connection-dot"></span>
+      <h1 class="panel__title">RENFE LIVE</h1>
+    </div>
+
+    <div class="search">
+      <input
+        id="search-input"
+        class="search__input"
+        type="search"
+        placeholder="🔎 Buscar tren, estación o destino..."
+        autocomplete="off"
+        aria-label="Buscar tren, estación o destino"
+        role="combobox"
+        aria-expanded="false"
+        aria-controls="search-results"
+        aria-autocomplete="list"
+      />
+      <ul id="search-results" class="search__results" role="listbox" hidden></ul>
+    </div>
+
+    <div class="panel__stats">
+      <div class="stat">
+        <span class="stat__label" id="train-count-label">Trenes detectados</span>
+        <span class="stat__value" id="train-count">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat__label">Última actualización</span>
+        <span class="stat__value" id="last-update">—</span>
+      </div>
+    </div>
+
+    <div class="panel__status">
+      <span class="stat__label">Estado</span>
+      <span class="stat__value" id="connection-status">conectando…</span>
+    </div>
+
+    <div class="panel__actions">
+      <button type="button" id="filters-toggle" class="toolbar__btn" aria-expanded="false" aria-controls="filters">
+        ⚙️ Filtros
+      </button>
+      <button type="button" id="legend-toggle" class="toolbar__btn" aria-expanded="false" aria-controls="legend">
+        🎨 Leyenda
+      </button>
+      <button type="button" id="trains-panel-toggle" class="toolbar__btn" aria-expanded="false" aria-controls="trains-panel">
+        ☰ Trenes
+      </button>
+    </div>
+
+    <!-- Filtros: servicios (dinámicos, desde los datos reales) y retraso -->
+    <div class="filters" id="filters" hidden>
+      <fieldset class="filters__group">
+        <legend class="filters__legend">Servicio</legend>
+        <!-- Rellenado dinámicamente en app.js + chip "TODOS" -->
+        <div class="filters__chips" id="service-filters"></div>
+      </fieldset>
+
+      <fieldset class="filters__group">
+        <legend class="filters__legend">Retraso</legend>
+        <div class="filters__chips" id="delay-filters">
+          <label class="chip"><input type="radio" name="delay-filter" value="all" checked /> <span>Todos</span></label>
+          <label class="chip"><input type="radio" name="delay-filter" value="ontime" /> <span>En hora</span></label>
+          <label class="chip"><input type="radio" name="delay-filter" value="5" /> <span>+5 min</span></label>
+          <label class="chip"><input type="radio" name="delay-filter" value="15" /> <span>+15 min</span></label>
+          <label class="chip"><input type="radio" name="delay-filter" value="30" /> <span>+30 min</span></label>
+          <label class="chip"><input type="radio" name="delay-filter" value="none" /> <span>Sin información</span></label>
+        </div>
+      </fieldset>
+    </div>
+
+    <!-- Leyenda desplegable: colores de servicio (dinámicos) y bordes de retraso -->
+    <div class="legend" id="legend" hidden>
+      <div class="legend__section">
+        <p class="legend__title">Borde del punto · retraso</p>
+        <ul class="legend__list">
+          <li class="legend__item"><span class="legend__dot legend__dot--b-ontime"></span>En hora (&lt; 5 min)</li>
+          <li class="legend__item"><span class="legend__dot legend__dot--b-5"></span>+5 min (5–14)</li>
+          <li class="legend__item"><span class="legend__dot legend__dot--b-15"></span>+15 min (15–29)</li>
+          <li class="legend__item"><span class="legend__dot legend__dot--b-30"></span>+30 min o más</li>
+          <li class="legend__item"><span class="legend__dot legend__dot--b-none"></span>Sin información</li>
+        </ul>
+      </div>
+      <div class="legend__section">
+        <p class="legend__title">Relleno del punto · servicio</p>
+        <ul class="legend__list" id="legend-services"></ul>
+      </div>
+    </div>
+
+    <p class="panel__error" id="error-message" role="status"></p>
+  </header>
+
+  <!-- Mapa + indicador flotante de "Siguiendo: ..." -->
+  <div class="map-wrap">
+    <main id="map" class="map" aria-label="Mapa de trenes de Renfe en tiempo real"></main>
+
+    <div class="follow-bar" id="follow-bar" hidden>
+      <span class="follow-bar__label" id="follow-label"></span>
+      <button type="button" class="follow-bar__btn" id="follow-stop">Dejar de seguir</button>
+    </div>
+  </div>
+
+  <!-- Panel lateral de trenes (según filtros activos) -->
+  <aside id="trains-panel" class="trains-panel" aria-label="Lista de trenes visibles" aria-hidden="true">
+    <div class="trains-panel__header">
+      <h2 class="trains-panel__title">Trenes <span class="trains-panel__count" id="trains-panel-count"></span></h2>
+      <button type="button" class="trains-panel__close" id="trains-panel-close" aria-label="Cerrar la lista de trenes">✕</button>
+    </div>
+
+    <div class="trains-panel__sort">
+      <label class="trains-panel__sort-label" for="trains-sort">Ordenar por</label>
+      <select id="trains-sort" class="trains-panel__select">
+        <option value="number">Número de tren</option>
+        <option value="service">Servicio</option>
+        <option value="delay">Retraso</option>
+        <option value="origin">Origen</option>
+        <option value="destination">Destino</option>
+      </select>
+    </div>
+
+    <ul class="trains-panel__list" id="trains-panel-list"></ul>
+  </aside>
+  <div class="trains-panel__backdrop" id="trains-panel-backdrop" hidden></div>
+
+  <!-- Ficha del tren (bottom sheet) SOLO en móvil: mismo contenido
+       que el popup de Leaflet, construido por app.js. -->
+  <section class="train-sheet" id="train-sheet" aria-label="Ficha del tren" aria-hidden="true">
+    <div class="train-sheet__bar">
+      <span class="train-sheet__grip" aria-hidden="true"></span>
+      <button type="button" class="train-sheet__close" id="train-sheet-close" aria-label="Cerrar la ficha del tren">✕</button>
+    </div>
+    <div class="train-sheet__content" id="train-sheet-content"></div>
+  </section>
+
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin=""
+  ></script>
+  <script src="app.js"></script>
+</body>
+</html>

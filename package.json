@@ -1,0 +1,13 @@
+{
+  "name": "renfe-live",
+  "version": "1.0.0",
+  "description": "Visualizador de trenes de Renfe en tiempo real sobre un mapa (Leaflet + OpenStreetMap).",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
