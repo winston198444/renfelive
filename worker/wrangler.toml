@@ -17,5 +17,7 @@ compatibility_date = "2026-01-01"
 # (constantes EDGE_CACHE_SECONDS y RENFE_FEEDS).
 
 # Orígenes permitidos (allowlist CORS). Sin "*".
-# En producción se definen aquí (descomentar) o en el dashboard:
-# ALLOWED_ORIGINS = "https://winston198444.github.io,https://renfe.example.com"
+# Se AÑADEN a los que ya van por defecto en el código (GitHub Pages y
+# localhost). En producción se definen aquí o en el dashboard:
+[vars]
+ALLOWED_ORIGINS = "https://renfelive.netmomo.com"
