@@ -1469,6 +1469,22 @@ function pasaFiltros(train) {
   return true;
 }
 
+/**
+ * Selección EXCLUSIVA de servicio (comportamiento tipo radio):
+ * por defecto se ven todos; al elegir un servicio sólo queda visible ese y el
+ * resto se deshabilita. Elegir otro servicio cambia la selección; "TODOS"
+ * restaura la vista completa.
+ */
+function seleccionarServicio(servicio) {
+  disabledServices.clear();
+  for (const train of currentTrains) {
+    const clave = claveServicio(train);
+    if (clave !== servicio) disabledServices.add(clave);
+  }
+  refrescarChipsServicio();
+  aplicarFiltros();
+}
+
 // Clave del último conjunto de servicios renderizado (evita reconstruir
 // el DOM de los chips si la lista de servicios no ha cambiado).
 let serviciosRenderizados = "";
@@ -1505,17 +1521,15 @@ function renderizarFiltrosServicio() {
   contenedor.appendChild(todos);
 
   for (const servicio of servicios) {
+    // Chip tipo radio: clic => ver SÓLO este servicio (el resto se
+    // deshabilita). Clic en otro chip cambia la selección; "TODOS" restaura.
     const chip = document.createElement("button");
     chip.type = "button";
     chip.className = "chip";
     chip.dataset.service = servicio;
     chip.textContent = servicio;
-    chip.addEventListener("click", () => {
-      if (disabledServices.has(servicio)) disabledServices.delete(servicio);
-      else disabledServices.add(servicio);
-      refrescarChipsServicio();
-      aplicarFiltros();
-    });
+    chip.title = `Ver solo ${servicio} · "TODOS" restaura todo`;
+    chip.addEventListener("click", () => seleccionarServicio(servicio));
     contenedor.appendChild(chip);
   }
 
