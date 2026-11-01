@@ -147,6 +147,11 @@ let zoomInternoTimer = null;
 let fichaAbiertaTripId = null; // tren mostrado en el bottom sheet
 let recorridoAbiertoTripId = null; // recorrido expandido con "Ver recorrido"
 
+/* --- Optimización de popups + estado en la URL --- */
+
+let popupAbiertoTripId = null; // tripId del popup de escritorio abierto (si lo hay)
+let estadoURLAplicado = false; // ¿ya se restauró el estado inicial desde la URL?
+
 let map = null;
 
 /* -----------------------------------------------------------------------
@@ -514,6 +519,18 @@ function markerStyleFor(train) {
   };
 }
 
+/** ¿El estilo actual del marcador difiere del nuevo? (evita repintado inútil) */
+function estiloDiferente(options, estilo) {
+  return (
+    options.radius !== estilo.radius ||
+    options.color !== estilo.color ||
+    options.weight !== estilo.weight ||
+    options.opacity !== estilo.opacity ||
+    options.fillColor !== estilo.fillColor ||
+    options.fillOpacity !== estilo.fillOpacity
+  );
+}
+
 function createTrainMarker(train) {
   const marker = L.circleMarker(
     [train.latitude, train.longitude],
@@ -522,7 +539,20 @@ function createTrainMarker(train) {
 
   // En escritorio se mantiene el popup de Leaflet (estructura actual).
   // En móvil la ficha se muestra como bottom sheet (sección 17).
-  if (!esMovil()) marker.bindPopup(buildPopupContent(train));
+  if (!esMovil()) {
+    marker.bindPopup(buildPopupContent(train));
+    // Sólo el popup ABIERTO se refresca en cada ciclo (ver syncMarkers); al
+    // abrirse se reconstruye con los datos actuales. Los popups cerrados no
+    // se regeneran, lo que ahorra ~200 reconstrucciones de HTML cada 15 s.
+    marker.on("popupopen", () => {
+      popupAbiertoTripId = train.tripId;
+      const datos = trainsById.get(train.tripId) ?? train;
+      marker.setPopupContent(buildPopupContent(datos));
+    });
+    marker.on("popupclose", () => {
+      if (popupAbiertoTripId === train.tripId) popupAbiertoTripId = null;
+    });
+  }
 
   marker.on("click", () => {
     if (esMovil()) {
@@ -554,12 +584,21 @@ function syncMarkers(trains) {
     const existingMarker = trainMarkers.get(train.tripId);
 
     if (existingMarker) {
-      // Tren ya conocido: se mueve el marcador y se refrescan estilo y
-      // popup con los datos nuevos (posición, retraso, servicio...) sin
-      // recrear el marcador ni sus listeners.
+      // Tren ya conocido: se mueve el marcador (la posición casi siempre
+      // cambia) y se refresca estilo/popup SÓLO si hace falta, sin recrear
+      // el marcador ni sus listeners.
       existingMarker.setLatLng([train.latitude, train.longitude]);
-      existingMarker.setStyle(markerStyleFor(train));
-      if (existingMarker.getPopup()) {
+
+      // Estilo: se aplica sólo si ha cambiado (evita repintado de Leaflet).
+      const estilo = markerStyleFor(train);
+      if (estiloDiferente(existingMarker.options, estilo)) {
+        existingMarker.setStyle(estilo);
+      }
+
+      // Popup: se regenera SÓLO el que está abierto (los cerrados se
+      // reconstruyen al abrirse, ver createTrainMarker). Evita repetir
+      // buildPopupContent para todos los trenes en cada ciclo.
+      if (existingMarker.getPopup() && popupAbiertoTripId === train.tripId) {
         existingMarker.setPopupContent(buildPopupContent(train));
       }
     } else {
@@ -1007,6 +1046,9 @@ async function updateTrains() {
     renderizarFiltrosServicio();
     aplicarFiltros();
 
+    // Una sola vez: restaura servicio/retraso/tren seguido desde la URL.
+    aplicarEstadoURL();
+
     showLastUpdate(payload.feedTimestamp);
     showConnectionStatus("connected");
 
@@ -1026,6 +1068,44 @@ async function updateTrains() {
   }
 }
 
+/* -----------------------------------------------------------------------
+ * Conmutador de tema (claro/oscuro)
+ *
+ * El tema inicial lo fija el script anti-destello de <head> (preferencia
+ * guardada o prefers-color-scheme). Aquí sólo se sincroniza el icono del
+ * botón y se persiste la elección manual del usuario en localStorage.
+ * -------------------------------------------------------------------- */
+
+function initTema() {
+  const btn = document.getElementById("theme-toggle");
+  if (!btn) return;
+
+  const temaActual = () => document.documentElement.getAttribute("data-theme") || "dark";
+
+  const sincronizar = () => {
+    const claro = temaActual() === "light";
+    btn.textContent = claro ? "🌙" : "☀️"; // muestra el tema al que conmuta
+    btn.setAttribute("aria-pressed", String(claro));
+    btn.setAttribute(
+      "aria-label",
+      claro ? "Cambiar a modo oscuro" : "Cambiar a modo claro"
+    );
+  };
+
+  sincronizar();
+
+  btn.addEventListener("click", () => {
+    const nuevo = temaActual() === "light" ? "dark" : "light";
+    document.documentElement.setAttribute("data-theme", nuevo);
+    try {
+      localStorage.setItem("renfe-tema", nuevo);
+    } catch {
+      /* modo privado: el tema cambia pero no se persiste */
+    }
+    sincronizar();
+  });
+}
+
 function start() {
   initMap();
   initSearch(); // el buscador se inicializa siempre (funciona con o sin datos)
@@ -1036,6 +1116,7 @@ function start() {
   initFichaMovil(); // bottom sheet de móvil
   initAccionesFicha(); // botones Seguir tren / Ver recorrido (delegación)
   initAtajosTeclado(); // Escape cierra panel/ficha/leyenda
+  initTema(); // conmutador claro/oscuro (icono + localStorage)
 
   if (isOpenedFromFileProtocol()) {
     const message =
@@ -1483,6 +1564,82 @@ function seleccionarServicio(servicio) {
   }
   refrescarChipsServicio();
   aplicarFiltros();
+  actualizarURL();
+}
+
+/* -----------------------------------------------------------------------
+ * Estado en la URL (compartible + persistente ante F5)
+ *
+ * La vista actual (servicio, retraso y tren seguido) se refleja en los
+ * query params (?servicio=AVE&retraso=30&tren=…). Así un enlace abre esa
+ * vista exacta y recargar no pierde los filtros. Se usa replaceState (sin
+ * historial) y sólo lo esencial: no se serializa el mapa.
+ * -------------------------------------------------------------------- */
+
+/** Servicio seleccionado en modo radio, o null si se ven todos. */
+function servicioSeleccionadoURL() {
+  if (disabledServices.size === 0) return null;
+  const servicios = [...new Set(currentTrains.map(claveServicio))];
+  const visibles = servicios.filter((s) => !disabledServices.has(s));
+  return visibles.length === 1 ? visibles[0] : null;
+}
+
+/** Refleja el estado actual en la URL (replaceState, sin history spam). */
+function actualizarURL() {
+  if (typeof window === "undefined" || !window.history?.replaceState) return;
+  if (!window.location || typeof window.location.pathname !== "string") return;
+
+  const params = new URLSearchParams();
+  const svc = servicioSeleccionadoURL();
+  if (svc) params.set("servicio", svc);
+  if (delayFilter && delayFilter !== "all") params.set("retraso", delayFilter);
+  if (followingTripId) params.set("tren", followingTripId);
+
+  const qs = params.toString();
+  const url = window.location.pathname + (qs ? "?" + qs : "") + (window.location.hash || "");
+  try {
+    window.history.replaceState(null, "", url);
+  } catch {
+    /* file:// u otros contextos sin historial: se ignora */
+  }
+}
+
+/** Restaura el estado inicial desde la URL (una sola vez, tras cargar datos). */
+function aplicarEstadoURL() {
+  if (estadoURLAplicado) return;
+  estadoURLAplicado = true;
+
+  const params = new URLSearchParams(window.location.search);
+
+  // Retraso (radios).
+  const retraso = params.get("retraso");
+  if (retraso) {
+    const radio = document.querySelector(
+      `#delay-filters input[name="delay-filter"][value="${retraso}"]`
+    );
+    if (radio) {
+      radio.checked = true;
+      delayFilter = retraso;
+    }
+  }
+
+  // Servicio (radio): se aplica el mismo aislamiento que seleccionarServicio.
+  const svc = params.get("servicio");
+  if (svc && [...new Set(currentTrains.map(claveServicio))].includes(svc)) {
+    disabledServices.clear();
+    for (const t of currentTrains) {
+      const c = claveServicio(t);
+      if (c !== svc) disabledServices.add(c);
+    }
+    refrescarChipsServicio();
+  }
+
+  // Recalcular visibilidad con el estado final de los filtros.
+  aplicarFiltros();
+
+  // Seguimiento: sólo si el tren existe y queda visible con los filtros.
+  const tren = params.get("tren");
+  if (tren && trainsById.has(tren) && visibleTripIds.has(tren)) iniciarSeguimiento(tren);
 }
 
 // Clave del último conjunto de servicios renderizado (evita reconstruir
@@ -1517,6 +1674,7 @@ function renderizarFiltrosServicio() {
     disabledServices.clear();
     refrescarChipsServicio();
     aplicarFiltros();
+    actualizarURL();
   });
   contenedor.appendChild(todos);
 
@@ -1562,6 +1720,7 @@ function initFiltros() {
     if (event.target.name !== "delay-filter") return;
     delayFilter = event.target.value;
     aplicarFiltros();
+    actualizarURL();
   });
 
   // Arranque: visibles en pantallas >=768 px; ocultos en móvil (la barra
@@ -1910,6 +2069,7 @@ function iniciarSeguimiento(tripId) {
   mostrarBarraSeguimiento(train);
   refrescarContenidoDelTren(tripId);
   if (anterior && anterior !== tripId) refrescarContenidoDelTren(anterior);
+  actualizarURL();
 }
 
 function detenerSeguimiento() {
@@ -1919,6 +2079,7 @@ function detenerSeguimiento() {
   followingTripId = null;
   document.getElementById("follow-bar").hidden = true;
   refrescarContenidoDelTren(anterior);
+  actualizarURL();
 
   console.log("[RENFE LIVE] Seguimiento detenido");
 }

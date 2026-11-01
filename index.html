@@ -3,7 +3,29 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="dark light" />
   <title>RENFE LIVE · Trenes en tiempo real</title>
+
+  <!-- Tema claro/oscuro (B1+A3): aplica la preferencia ANTES de pintar
+       para evitar destellos. Guarda "renfe-tema" en localStorage; si no
+       hay nada guardado, respeta prefers-color-scheme del sistema. -->
+  <script>
+    (function () {
+      var tema = null;
+      try {
+        tema = localStorage.getItem("renfe-tema");
+      } catch (e) {
+        /* modo privado o file://: se ignora */
+      }
+      if (tema !== "light" && tema !== "dark") {
+        tema =
+          window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches
+            ? "light"
+            : "dark";
+      }
+      document.documentElement.setAttribute("data-theme", tema);
+    })();
+  </script>
 
   <link
     rel="stylesheet"
@@ -67,6 +89,9 @@
       <button type="button" id="trains-panel-toggle" class="toolbar__btn" aria-expanded="false" aria-controls="trains-panel">
         ☰ Trenes
       </button>
+      <!-- Conmutador de tema: muestra el icono del tema al que conmuta.
+           La accesibilidad va por aria-label (se actualiza en app.js). -->
+      <button type="button" id="theme-toggle" class="toolbar__btn" aria-label="Cambiar a modo claro">☀️</button>
     </div>
 
     <!-- Filtros: servicios (dinámicos, desde los datos reales) y retraso -->
