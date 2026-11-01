@@ -1,0 +1,9 @@
+# Dependencias (el proyecto no usa ninguna, pero por si acaso)
+node_modules/
+
+# Datos GTFS preprocesados: generados por `npm run data` (local) o por
+# GitHub Actions (producción). NO se versionan.
+data/
+
+# Artefacto estático para GitHub Pages: generado por `npm run site`.
+_site/

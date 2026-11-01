@@ -4,7 +4,9 @@
   "description": "Visualizador de trenes de Renfe en tiempo real sobre un mapa (Leaflet + OpenStreetMap).",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "data": "node scripts/build-gtfs.js",
+    "site": "node scripts/assemble-site.js"
   },
   "engines": {
     "node": ">=18"

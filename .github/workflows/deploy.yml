@@ -1,0 +1,73 @@
+# RENFE LIVE · build + preprocesado GTFS + deploy en GitHub Pages
+#
+# Actions solo hace: BUILD, PREPROCESADO y DEPLOY (nunca realtime).
+# Si el build falla (p. ej. Renfe caído), el job falla y NO se despliega:
+# GitHub Pages conserva el último artefacto correcto publicado.
+#
+# Ejecuciones:
+#   - push a main
+#   - manual (Actions > Build y deploy GTFS > Run workflow)
+#   - diaria programada (04:17 UTC): Renfe publica el GTFS a diario y
+#     aparecen viajes con fechas nuevas que hay que refrescar.
+
+name: Build y deploy GTFS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * *"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Validar sintaxis de los scripts
+        run: |
+          node --check server.js
+          node --check lib/gtfs-format.js
+          node --check scripts/build-gtfs.js
+          node --check scripts/assemble-site.js
+          node --check app.js
+
+      - name: Preprocesar GTFS (data/*.json)
+        # Valida status HTTP del ZIP, los 4 CSV, y que los JSON no estén
+        # vacíos. Si algo falla -> exit != 0 -> NO se despliega nada.
+        run: node scripts/build-gtfs.js
+
+      - name: Ensamblar _site/
+        run: node scripts/assemble-site.js
+
+      - name: Subir artefacto de Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build # solo se despliega si el build termina bien
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Desplegar en GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

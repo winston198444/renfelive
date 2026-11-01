@@ -1,0 +1,21 @@
+# Configuración de la Cloudflare Worker "renfe-live-proxy".
+#
+# Despliegue (ver README.md):
+#   npx wrangler deploy
+#
+# La variable ALLOWED_ORIGINS se define en el dashboard o con:
+#   npx wrangler secret put ALLOWED_ORIGINS   (o Variable, en Settings)
+# Valor: lista separada por comas de orígenes permitidos, p. ej.
+#   https://winston198444.github.io,https://renfe.example.com
+
+name = "renfe-live-proxy"
+main = "renfe-proxy.js"
+compatibility_date = "2026-01-01"
+
+# La caché edge compartida (12 s, menor que el refresco visual de 15 s)
+# y los endpoints de Renfe están fijados en renfe-proxy.js
+# (constantes EDGE_CACHE_SECONDS y RENFE_FEEDS).
+
+# Orígenes permitidos (allowlist CORS). Sin "*".
+# En producción se definen aquí (descomentar) o en el dashboard:
+# ALLOWED_ORIGINS = "https://winston198444.github.io,https://renfe.example.com"

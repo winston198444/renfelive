@@ -1,14 +1,21 @@
 /* =========================================================================
  * RENFE LIVE — visualización de trenes de Renfe sobre un mapa
  *
- * FASE 2: el popup enriquece la información del tren con los datos
- * resueltos por el backend (nombres de estaciones, origen, destino,
- * recorrido y servicio), obtenidos del GTFS estático oficial de Renfe.
+ * El popup enriquece la información del tren con los datos resueltos
+ * combinando el GTFS-Realtime de Renfe con el GTFS estático oficial
+ * preprocesado (nombres de estaciones, origen, destino, recorrido y
+ * servicio).
+ *
+ * Arquitectura de datos (ver sección 3):
+ *   - data/*.json  -> GTFS estático preprocesado (GitHub Actions + Pages)
+ *   - /api/*       -> proxy de los feeds GTFS-Realtime (server.js en local,
+ *                     Cloudflare Worker en producción)
+ *   - join         -> en el navegador (construirTrenes)
  *
  * Estructura del fichero:
  *   1. Configuración y estado
  *   2. Inicialización del mapa
- *   3. Consulta al backend local
+ *   3. Capa de datos (estáticos + realtime + join)
  *   4. Procesamiento de los datos
  *   5. Creación de marcadores
  *   6. Actualización de marcadores
@@ -32,10 +39,45 @@
  * 1. Configuración y estado
  * -------------------------------------------------------------------- */
 
-// El navegador consulta SIEMPRE a nuestro backend local, que es quien
-// habla con Renfe (los feeds no permiten CORS) y quien resuelve los IDs
-// con el GTFS estático.
-const TRAINS_ENDPOINT = "/api/trains";
+/* Capa de datos: MISMA aplicación en local y en producción; solo cambia
+ * el ORIGEN de los dos feeds GTFS-Realtime:
+ *
+ *   - local (localhost/127.0.0.1): rutas del propio server.js (npm start),
+ *     que actúa de proxy porque los feeds de Renfe NO envían CORS.
+ *   - producción (GitHub Pages): Cloudflare Worker que hace de proxy CORS
+ *     hacia los mismos feeds (endpoints fijados en el Worker).
+ *
+ * Los JSON estáticos preprocesados del GTFS (data/*.json) usan rutas
+ * RELATIVAS: los sirve server.js en local y GitHub Pages en producción.
+ *
+ * IMPORTANTE (solo producción): tras desplegar el Worker, sustituye
+ * WORKER_BASE_URL por la URL real de TU Worker:
+ *   https://<tu-subdominio>.workers.dev
+ * Ver README.md ("Configuración del Worker").
+ */
+const WORKER_BASE_URL = "https://renfe-live-proxy.TU_SUBDOMINIO.workers.dev";
+
+const ES_LOCALHOST = ["localhost", "127.0.0.1", "[::1]"].includes(
+  String(window.location.hostname ?? "")
+);
+
+/** Configuración única de la capa de datos (sin URLs dispersas). */
+const DATA_CONFIG = {
+  // Carpeta de los JSON estáticos (relativa al index.html).
+  staticBase: "data/",
+
+  // Rutas GTFS-Realtime: idénticas en ambos entornos (son las que
+  // sirven server.js en local y el Worker en producción).
+  realtimeUrl(path) {
+    const origin = ES_LOCALHOST ? "" : WORKER_BASE_URL;
+    return `${origin}${path}`;
+  },
+};
+
+/** En producción, ¿sigue sin configurar la URL del Worker? */
+function faltaConfigurarWorker() {
+  return !ES_LOCALHOST && WORKER_BASE_URL.includes("TU_SUBDOMINIO");
+}
 
 const REFRESH_INTERVAL_MS = 15000; // 15 segundos
 
@@ -131,61 +173,168 @@ function initMap() {
 }
 
 /* -----------------------------------------------------------------------
- * 3. Consulta al backend local
+ * 3. Capa de datos
+ *
+ * PRODUCCIÓN (GitHub Pages):
+ *   - data/*.json -> GTFS estático preprocesado por GitHub Actions.
+ *                    Se cargan UNA vez al abrir la página y quedan en
+ *                    memoria (Map con acceso O(1)); jamás se vuelven a
+ *                    descargar en cada actualización realtime.
+ *   - Worker CORS -> los dos feeds GTFS-Realtime de Renfe (cada 15 s).
+ *   - El join realtime+estático se hace AQUÍ, en el navegador, y produce
+ *     el MISMO objeto "train" que /api/trains de server.js.
+ *
+ * DESARROLLO LOCAL (npm start): idéntico, pero los feeds los sirve
+ * server.js (mismo origen) y los JSON estáticos también, generados con
+ * `npm run data`.
  * -------------------------------------------------------------------- */
 
-async function fetchTrains() {
-  let response;
+// Índices estáticos en memoria (carga única; ver cargarDatosEstaticos).
+const gtfs = {
+  stopsById: new Map(), // stopId  -> nombre real de la estación
+  routesById: new Map(), // routeId -> servicio (route_short_name)
+  tripsById: new Map(), // tripId  -> [routeId, número de tren]
+  stopTimesByTrip: new Map(), // tripId  -> [[stopId, "HH:MM:SS"], ...] ordenado
+  loadedAt: null, // fecha de construcción del JSON (meta.json)
+};
 
+/** Valida que una posición GPS sea utilizable (mismo criterio que server.js). */
+function isValidPosition(position) {
+  if (!position) return false;
+
+  const { latitude, longitude } = position;
+
+  return (
+    typeof latitude === "number" &&
+    typeof longitude === "number" &&
+    Number.isFinite(latitude) &&
+    Number.isFinite(longitude) &&
+    Math.abs(latitude) <= 90 &&
+    Math.abs(longitude) <= 180
+  );
+}
+
+/**
+ * Descarga y parsea un JSON. Lanza errores con "kind" para que la interfaz
+ * pueda distinguir fallo de red / estado HTTP / JSON inválido.
+ */
+async function fetchJson(url, { timeoutMs = 10000, cache = "no-store" } = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  let response;
   try {
-    response = await fetch(TRAINS_ENDPOINT, { cache: "no-store" });
+    response = await fetch(url, { cache, signal: controller.signal });
   } catch (networkError) {
     console.error("[diagnóstico] fetch() lanzó un error de red:", {
       mensaje: networkError.message,
-      endpoint: TRAINS_ENDPOINT,
+      endpoint: url,
       origen: window.location.href,
     });
-    throw new Error(
-      `No se ha podido contactar con el backend local (${TRAINS_ENDPOINT}): ${networkError.message}`
-    );
+    const error = new Error(`No se ha podido contactar con ${url}: ${networkError.message}`);
+    error.kind = "network";
+    throw error;
+  } finally {
+    clearTimeout(timeout);
   }
 
-  console.log("[diagnóstico] Respuesta del backend:", {
+  console.log("[diagnóstico] Respuesta del servidor de datos:", {
+    endpoint: url,
     status: response.status,
-    statusText: response.statusText,
     contentType: response.headers.get("content-type"),
   });
 
   if (!response.ok) {
-    throw new Error(`El backend respondió con estado HTTP ${response.status}`);
+    const error = new Error(`${url} respondió con estado HTTP ${response.status}`);
+    error.kind = "http";
+    error.status = response.status;
+    throw error;
   }
 
   const rawText = await response.text();
 
-  let payload;
   try {
-    payload = JSON.parse(rawText);
+    return JSON.parse(rawText);
   } catch (parseError) {
     console.error(
       "[diagnóstico] La respuesta NO es JSON válido. Primeros 300 caracteres:",
       rawText.slice(0, 300)
     );
-    throw new Error("La respuesta del backend no es JSON válido");
+    const error = new Error(`La respuesta de ${url} no es JSON válido`);
+    error.kind = "json";
+    throw error;
+  }
+}
+
+/**
+ * Carga ÚNICA de los JSON estáticos preprocesados (data/*.json).
+ * Valida que cada fichero exista y no esté vacío antes de indexarlo.
+ */
+async function cargarDatosEstaticos() {
+  const base = DATA_CONFIG.staticBase;
+
+  const [stops, routes, trips, stopTimes, meta] = await Promise.all([
+    fetchJson(`${base}stops.json`, { cache: "force-cache" }),
+    fetchJson(`${base}routes.json`, { cache: "force-cache" }),
+    fetchJson(`${base}trips.json`, { cache: "force-cache" }),
+    fetchJson(`${base}stop_times.json`, { cache: "force-cache" }),
+    fetchJson(`${base}meta.json`, { cache: "force-cache" }),
+  ]);
+
+  // Validación: deben ser objetos no vacíos (build correcto de Actions).
+  const objetos = {
+    "stops.json": stops,
+    "routes.json": routes,
+    "trips.json": trips,
+    "stop_times.json": stopTimes,
+  };
+  for (const [nombre, datos] of Object.entries(objetos)) {
+    if (!datos || typeof datos !== "object" || Object.keys(datos).length === 0) {
+      throw new Error(`${base}${nombre} está vacío o no es un objeto válido`);
+    }
   }
 
-  // Diagnóstico: muestra real de la estructura recibida.
-  console.log(
-    "[diagnóstico] Muestra de trenes recibidos (el primero):",
-    JSON.stringify(payload.trains?.[0] ?? null, null, 2)
-  );
+  for (const [id, nombre] of Object.entries(stops)) gtfs.stopsById.set(id, nombre);
+  for (const [id, servicio] of Object.entries(routes)) gtfs.routesById.set(id, servicio);
+  for (const [id, par] of Object.entries(trips)) gtfs.tripsById.set(id, par);
+  for (const [id, paradas] of Object.entries(stopTimes)) gtfs.stopTimesByTrip.set(id, paradas);
 
-  return payload;
+  gtfs.loadedAt = meta?.builtAt ?? null;
+
+  console.log(
+    `[datos] GTFS estático cargado: ${gtfs.stopsById.size} estaciones, ` +
+      `${gtfs.tripsById.size} viajes, ${gtfs.routesById.size} líneas, ` +
+      `${gtfs.stopTimesByTrip.size} recorridos (build: ${gtfs.loadedAt})`
+  );
 }
+
+/**
+ * Descarga los dos feeds GTFS-Realtime (vehicle_positions + trip_updates).
+ * Política idéntica a server.js: o llegan AMBOS o se lanza error
+ * (nunca se rellenan huecos con datos inventados).
+ */
+async function fetchFeedsRealtime() {
+  const [vehicleFeed, tripFeed] = await Promise.all([
+    fetchJson(DATA_CONFIG.realtimeUrl("/api/vehicle-positions")),
+    fetchJson(DATA_CONFIG.realtimeUrl("/api/trip-updates")),
+  ]);
+
+  return { vehicleFeed, tripFeed };
+}
+
+/* -----------------------------------------------------------------------
+ * 3b. Join realtime + GTFS estático (antes lo hacía server.js)
+ *
+ * Relación: tripId (vehicle) == tripId (tripUpdate) == tripId (GTFS).
+ * El resultado es EXACTAMENTE el mismo objeto "train" que devolvía
+ * /api/trains, así que nada más de la aplicación cambia.
+ * -------------------------------------------------------------------- */
 
 /* -----------------------------------------------------------------------
  * 4. Procesamiento de los datos
  *
- * El backend devuelve cada tren ya enriquecido y relacionado:
+ * construirTrenes() combina los feeds en tiempo real con el GTFS
+ * estático y devuelve cada tren ya enriquecido y relacionado:
  *   tripId           -> identificador del viaje (clave única del marcador)
  *   trainNumber      -> número de tren (GTFS estático)
  *   service          -> servicio/linea, ej. "MD", "AVLO" (GTFS estático)
@@ -198,6 +347,120 @@ async function fetchTrains() {
  *   route            -> recorrido [{ stopId, name, scheduledArrival,
  *                        liveArrival, skipped }]
  * -------------------------------------------------------------------- */
+
+/**
+ * Combina vehicle_positions + trip_updates + GTFS estático EN EL NAVEGADOR.
+ * (Lógica gemela de buildEnrichedTrains() en server.js, para desarrollo
+ * local vía /api/trains y diagnóstico; el frontend usa esta.)
+ */
+function construirTrenes(vehicleFeed, tripFeed) {
+  // Índice de actualizaciones por tripId para relacionar con las posiciones.
+  const updatesByTripId = new Map();
+  for (const entity of tripFeed?.entity ?? []) {
+    const update = entity.tripUpdate;
+    const tripId = update?.trip?.tripId;
+    if (tripId) updatesByTripId.set(tripId, update);
+  }
+
+  const trains = [];
+  const entities = Array.isArray(vehicleFeed?.entity) ? vehicleFeed.entity : [];
+
+  for (const entity of entities) {
+    const vehicle = entity.vehicle;
+    const tripId = vehicle?.trip?.tripId;
+
+    if (!tripId || !isValidPosition(vehicle?.position)) continue;
+
+    const update = updatesByTripId.get(tripId) ?? null;
+    const stopTimeUpdates = update?.stopTimeUpdate ?? [];
+
+    // Mapa de paradas del viaje segun el feed en tiempo real.
+    const updateByStopId = new Map();
+    const skippedStopIds = new Set();
+
+    for (const stu of stopTimeUpdates) {
+      if (stu?.stopId) updateByStopId.set(stu.stopId, stu);
+      if (stu?.scheduleRelationship === "SKIPPED" && stu?.stopId) {
+        skippedStopIds.add(stu.stopId);
+      }
+    }
+
+    // --- GTFS estatico: servicio, numero de tren, origen, destino, recorrido ---
+    const gtfsTrip = gtfs.tripsById.get(tripId) ?? null; // [routeId, shortName]
+    const routeId = gtfsTrip ? gtfsTrip[0] : null;
+    const servicio = routeId ? gtfs.routesById.get(routeId) : null;
+    const scheduledStops = gtfs.stopTimesByTrip.get(tripId) ?? [];
+
+    const originStopId = scheduledStops.length > 0 ? scheduledStops[0][0] : null;
+    const destinationStopId =
+      scheduledStops.length > 0 ? scheduledStops[scheduledStops.length - 1][0] : null;
+
+    // Recorrido completo con nombres reales (solo si el GTFS lo conoce).
+    const route = scheduledStops.map((stop) => {
+      const stopId = stop[0];
+      const liveUpdate = updateByStopId.get(stopId) ?? null;
+      return {
+        stopId,
+        name: gtfs.stopsById.get(stopId) ?? null,
+        scheduledArrival: stop[1] || null,
+        liveArrival: liveUpdate?.arrival?.time ? Number(liveUpdate.arrival.time) : null,
+        skipped: skippedStopIds.has(stopId),
+      };
+    });
+
+    // --- Proxima parada: el stopId del feed en tiempo real ---
+    const currentStopId = vehicle?.stopId ?? null;
+    const currentUpdate = currentStopId ? updateByStopId.get(currentStopId) : null;
+
+    // Llegada prevista y retraso: del stopTimeUpdate de la proxima parada.
+    const liveArrival = currentUpdate?.arrival ?? null;
+    const delaySeconds =
+      typeof liveArrival?.delay === "number"
+        ? liveArrival.delay
+        : typeof update?.delay === "number"
+          ? update.delay
+          : null;
+
+    trains.push({
+      // Identificadores tecnicos (se conservan internamente).
+      tripId,
+      stopId: currentStopId,
+
+      // Numero de tren y servicio, del GTFS estatico cuando esta disponible.
+      trainNumber: gtfsTrip?.[1] || vehicle?.vehicle?.id || null,
+      service: servicio || null,
+
+      // Origen y destino resueltos con nombres reales del GTFS estatico.
+      origin: originStopId
+        ? { stopId: originStopId, name: gtfs.stopsById.get(originStopId) ?? null }
+        : null,
+      destination: destinationStopId
+        ? { stopId: destinationStopId, name: gtfs.stopsById.get(destinationStopId) ?? null }
+        : null,
+
+      // Proxima parada y su llegada prevista en tiempo real.
+      nextStop: currentStopId
+        ? { stopId: currentStopId, name: gtfs.stopsById.get(currentStopId) ?? null }
+        : null,
+      nextStopArrival: liveArrival?.time ? Number(liveArrival.time) : null,
+      delaySeconds,
+
+      // Estado y posicion GPS.
+      currentStatus: vehicle?.currentStatus ?? null,
+      latitude: vehicle.position.latitude,
+      longitude: vehicle.position.longitude,
+
+      // Recorrido del viaje con nombres reales.
+      route,
+    });
+  }
+
+  return {
+    trains,
+    feedTimestamp: vehicleFeed?.header?.timestamp ?? null,
+    gtfsLoadedAt: gtfs.loadedAt,
+  };
+}
 
 function isValidTrain(train) {
   return (
@@ -672,17 +935,19 @@ function handleFetchError(error, hayDatosPrevios = false) {
   console.error("[RENFE LIVE] Error al consultar los trenes:", error);
 
   // Mensaje sencillo en la interfaz, pero específico según el fallo real,
-  // para que se distinga sin abrir la consola.
+  // para que se distinga sin abrir la consola. En local se menciona el
+  // servidor local; en producción, el proxy de Cloudflare.
   let uiMessage = "No se han podido obtener los datos de Renfe. Reintentando…";
 
-  if (error.message.includes("backend local")) {
-    uiMessage =
-      "No se llega al backend local. Ejecuta 'npm start' y abre http://localhost:3000 " +
-      "(no el archivo index.html). Reintentando…";
-  } else if (error.message.includes("estado HTTP")) {
-    uiMessage = "El backend local ha respondido con un error. Reintentando…";
-  } else if (error.message.includes("JSON")) {
-    uiMessage = "El backend ha devuelto una respuesta que no es JSON válido. Reintentando…";
+  if (error.kind === "network") {
+    uiMessage = ES_LOCALHOST
+      ? `No se llega al servidor local (${window.location.origin}). Ejecuta 'npm start' ` +
+        "y vuelve a cargar la página desde el navegador (no el archivo index.html). Reintentando…"
+      : "No se ha podido contactar con el proxy de datos de tiempo real. Reintentando…";
+  } else if (error.kind === "http") {
+    uiMessage = `El servidor de datos ha respondido con un error (HTTP ${error.status ?? "?"}). Reintentando…`;
+  } else if (error.kind === "json") {
+    uiMessage = "El servidor de datos ha devuelto una respuesta que no es JSON válido. Reintentando…";
   }
 
   if (hayDatosPrevios) {
@@ -703,8 +968,8 @@ function handleFetchError(error, hayDatosPrevios = false) {
  * -------------------------------------------------------------------- */
 
 // Aviso claro cuando la página se abre directamente desde el disco (file://).
-// En ese caso no hay backend local, así que la consulta a Renfe es imposible
-// y los tiles del mapa se bloquean por falta de cabecera Referer.
+// En ese caso no hay servidor (ni Pages ni server.js), así que la consulta
+// a Renfe es imposible y los tiles del mapa se bloquean por Referer.
 function isOpenedFromFileProtocol() {
   return window.location.protocol === "file:";
 }
@@ -715,7 +980,17 @@ async function updateTrains() {
   showConnectionStatus("updating");
 
   try {
-    const payload = await fetchTrains();
+    // Solo los dos feeds realtime (~300 KB): los JSON estáticos ya están
+    // en memoria desde la carga inicial y NO se vuelven a descargar.
+    const { vehicleFeed, tripFeed } = await fetchFeedsRealtime();
+    const payload = construirTrenes(vehicleFeed, tripFeed);
+
+    // Diagnóstico: muestra real de la estructura construida.
+    console.log(
+      "[diagnóstico] Muestra de trenes recibidos (el primero):",
+      JSON.stringify(payload.trains?.[0] ?? null, null, 2)
+    );
+
     const trains = extractTrains(payload);
 
     // El buscador y los filtros trabajan siempre sobre los datos más
@@ -765,11 +1040,48 @@ function start() {
   if (isOpenedFromFileProtocol()) {
     const message =
       "Estás abriendo index.html directamente (file://). " +
-      "Ejecuta 'npm start' en la carpeta del proyecto y abre http://localhost:3000 en el navegador.";
+      "En local, ejecuta 'npm start' en la carpeta del proyecto y abre " +
+      "http://localhost:3000 en el navegador.";
 
     console.error("[RENFE LIVE] " + message);
     showConnectionStatus("error", message);
-    return; // sin backend local no tiene sentido refrescar
+    return; // sin servidor no hay datos que actualizar
+  }
+
+  if (faltaConfigurarWorker()) {
+    const message =
+      "Configuración pendiente: sustituye WORKER_BASE_URL en app.js por la URL real " +
+      "de tu Cloudflare Worker (ver README.md, sección 'Configuración del Worker').";
+
+    console.error("[RENFE LIVE] " + message);
+    showConnectionStatus("error", message);
+    return;
+  }
+
+  // Los JSON estáticos se cargan UNA vez; si fallan (p. ej. despliegue en
+  // curso), se reintenta en 60 s sin bloquear nada más.
+  arrancarConDatosEstaticos();
+}
+
+/** Carga data/*.json con reintentos; cuando sale, inicia el ciclo de 15 s. */
+async function arrancarConDatosEstaticos() {
+  showConnectionStatus("updating");
+
+  try {
+    await cargarDatosEstaticos();
+  } catch (error) {
+    console.error("[RENFE LIVE] No se pudieron cargar los JSON estáticos:", error);
+
+    const pista = ES_LOCALHOST
+      ? "En local, ejecuta 'npm run data' para generar data/*.json."
+      : "Puede que el despliegue de GitHub Actions siga en curso.";
+
+    showConnectionStatus(
+      "error",
+      `No se han podido cargar los datos estáticos (data/*.json). ${pista} Reintentando en 60 s…`
+    );
+    setTimeout(arrancarConDatosEstaticos, 60000);
+    return;
   }
 
   updateTrains(); // primera carga inmediata
