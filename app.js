@@ -55,7 +55,7 @@
  *   https://<tu-subdominio>.workers.dev
  * Ver README.md ("Configuración del Worker").
  */
-const WORKER_BASE_URL = "https://renfe-live-proxy.TU_SUBDOMINIO.workers.dev";
+const WORKER_BASE_URL = "https://renfe-live-proxy.198cuatro.workers.dev";
 
 const ES_LOCALHOST = ["localhost", "127.0.0.1", "[::1]"].includes(
   String(window.location.hostname ?? "")

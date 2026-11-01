@@ -191,15 +191,17 @@ código (`RENFE_FEEDS`), no hay secretos de Renfe ni claves de API.
 - Cualquier otro origen recibe `403`; el Worker **no es un proxy abierto**
   y solo reenvía las dos URLs fijas de Renfe.
 
-### Paso final en `app.js`
+### URL del Worker en `app.js`
 
-Sustituir en `app.js` (constante de la sección 1):
+Ya configurada en este repositorio:
 
 ```js
-const WORKER_BASE_URL = "https://renfe-live-proxy.TU_SUBDOMINIO.workers.dev";
+const WORKER_BASE_URL = "https://renfe-live-proxy.198cuatro.workers.dev";
 ```
 
-por la URL real que devuelve `wrangler deploy`, y hacer commit+push.
+Si en el futuro se despliega el Worker con otro nombre/dominio, basta
+sustituir esa constante (sección 1 de `app.js`) por la nueva URL y
+hacer commit+push. No hay ninguna otra URL del Worker en el código.
 
 ---
 

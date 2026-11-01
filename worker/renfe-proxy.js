@@ -119,6 +119,7 @@ export default {
     const cache = caches.default;
 
     let cached = await cache.match(cacheKey);
+    const wasHit = Boolean(cached);
 
     if (!cached) {
       const controller = new AbortController();
@@ -142,7 +143,8 @@ export default {
       }
 
       // El cuerpo se lee una sola vez: se envía al cliente y se guarda en
-      // caché a partir de una copia en memoria.
+      // caché a partir de una copia en memoria. (Sin X-Edge-Cache: ese
+      // valor se decide al servir, no al guardar.)
       const bodyText = await upstream.text();
 
       cached = new Response(bodyText, {
@@ -150,7 +152,6 @@ export default {
         headers: {
           "Content-Type": "application/json; charset=utf-8",
           "Cache-Control": `public, max-age=${EDGE_CACHE_SECONDS}`,
-          "X-Edge-Cache": "MISS",
         },
       });
 
@@ -160,7 +161,7 @@ export default {
     // --- Respuesta final + cabeceras CORS ---
     const headers = new Headers(cached.headers);
     headers.set("Cache-Control", `public, max-age=${EDGE_CACHE_SECONDS}`);
-    if (!headers.has("X-Edge-Cache")) headers.set("X-Edge-Cache", "HIT");
+    headers.set("X-Edge-Cache", wasHit ? "HIT" : "MISS");
     for (const [key, value] of Object.entries(corsHeaders)) headers.set(key, value);
 
     return new Response(cached.body, { status: 200, headers });
