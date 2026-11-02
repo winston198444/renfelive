@@ -635,28 +635,6 @@ button.chip[aria-pressed="false"] {
   background: rgba(239, 68, 68, 0.3);
 }
 
-/* ---------- Aviso "Proyecto no oficial" ---------- */
-
-/* Discreto, esquina inferior-izquierda del mapa (abajo-derecha la
- * atribución de Leaflet, arriba-izquierda el zoom, arriba-derecha la
- * follow-bar). No intercepta el ratón para no estorbar al mapa. */
-.disclaimer {
-  position: absolute;
-  left: 8px;
-  bottom: 8px;
-  z-index: 1000;
-  max-width: calc(100% - 16px);
-  margin: 0;
-  padding: 3px 8px;
-  border-radius: 6px;
-  background: rgb(var(--surface-rgb) / 0.72);
-  color: var(--text-muted);
-  font-size: 0.68rem;
-  line-height: 1.35;
-  pointer-events: none;
-  user-select: none;
-}
-
 /* ---------- Panel lateral de trenes ---------- */
 
 .trains-panel {

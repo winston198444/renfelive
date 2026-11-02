@@ -161,6 +161,11 @@ let map = null;
 function initMap() {
   map = L.map("map", { zoomControl: true }).setView(MAP_CENTER, MAP_ZOOM);
 
+  // Sin el prefijo "🇺🇦 Leaflet" en la esquina inferior-derecha: estorba
+  // la lectura de los popups. La atribución de OpenStreetMap/FOSSGIS se
+  // conserva (obligatoria por licencia ODbL de los tiles).
+  map.attributionControl.setPrefix("");
+
   // Mapa base: tiles de OSM Alemania (tile.openstreetmap.de).
   // Es el fork alemán de OpenStreetMap Carto, operado por FOSSGIS e.V.,
   // gratuito y financiado por donaciones. A diferencia de
@@ -916,18 +921,52 @@ function escapeAttr(text) {
  * (sección 13) para reflejar también la cifra de trenes VISIBLES.
  * -------------------------------------------------------------------- */
 
-function showLastUpdate(timestampSeconds) {
-  const element = document.getElementById("last-update");
+/* Reloj local del "hace X" de la última actualización.
+ *
+ * El feed de Renfe publica el timestamp con ~1 h de retraso desde el
+ * cambio de hora (bug de su generador), así que el relativo NUNCA se
+ * calcula contra la hora del feed: en cuanto llega un timestamp distinto
+ * al anterior, apuntamos cuándo lo vimos con nuestro reloj. De este modo
+ * es inmune al desfase del feed y a la zona horaria del usuario, y se
+ * autocorrige solo si Renfe arregla su generador. */
+let ultimoFeedTimestamp = null;
+let ultimaActualizacionLocalMs = null;
 
+/** Formatea un intervalo: "ahora mismo" / "hace15 s" / "hace4 min" / "hace1 h5 min". */
+function formatoRelativo(ms) {
+  const segundos = Math.floor(ms / 1000);
+  if (segundos < 10) return "ahora mismo";
+  if (segundos < 60) return `hace ${segundos} s`;
+  const minutos = Math.floor(segundos / 60);
+  if (minutos < 60) return `hace ${minutos} min`;
+  const horas = Math.floor(minutos / 60);
+  const restoMin = minutos % 60;
+  return restoMin > 0 ? `hace ${horas} h${restoMin} min` : `hace ${horas} h`;
+}
+
+/** Repinta el relativo SIN mover el reloj (lo usa el intervalo de refresco). */
+function refrescarUltimaActualizacion() {
+  if (ultimaActualizacionLocalMs === null) return;
+  const element = document.getElementById("last-update");
+  element.textContent = formatoRelativo(Date.now() - ultimaActualizacionLocalMs);
+}
+
+function showLastUpdate(timestampSeconds) {
   // El feed envía el timestamp como texto (ej. "1793351779").
   const numericTimestamp = Number(timestampSeconds);
 
-  if (!Number.isFinite(numericTimestamp) || numericTimestamp <= 0) {
-    element.textContent = new Date().toLocaleTimeString("es-ES");
-    return;
+  if (Number.isFinite(numericTimestamp) && numericTimestamp > 0) {
+    // Timestamp nuevo del feed -> anclamos el reloj LOCAL de la app.
+    if (numericTimestamp !== ultimoFeedTimestamp) {
+      ultimoFeedTimestamp = numericTimestamp;
+      ultimaActualizacionLocalMs = Date.now();
+    }
+  } else if (ultimaActualizacionLocalMs === null) {
+    // Primer arranque sin datos válidos: sin ancla previa, contamos desde ya.
+    ultimaActualizacionLocalMs = Date.now();
   }
 
-  element.textContent = new Date(numericTimestamp * 1000).toLocaleTimeString("es-ES");
+  refrescarUltimaActualizacion();
 }
 
 // Estados de conexión FASE 3: dependen del RESULTADO REAL de cada
@@ -1167,6 +1206,10 @@ async function arrancarConDatosEstaticos() {
 
   updateTrains(); // primera carga inmediata
   setInterval(updateTrains, REFRESH_INTERVAL_MS); // refresco cada 15 s
+
+  // El "hace X" de la última actualización sigue corriendo aunque
+  // falle una carga: el ancla solo se mueve con un timestamp nuevo.
+  setInterval(refrescarUltimaActualizacion, REFRESH_INTERVAL_MS);
 }
 
 /* -----------------------------------------------------------------------
