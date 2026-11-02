@@ -81,6 +81,13 @@ function faltaConfigurarWorker() {
 
 const REFRESH_INTERVAL_MS = 15000; // 15 segundos
 
+// El GTFS estático (data/*.json) se reconstruye a diario en Actions y Renfe
+// publica viajes nuevos cada día. Se recarga cada 30 min (y al volver a la
+// pestaña) para que un tren de una fecha nueva no se quede sin origen/destino
+// por estar usando un GTFS viejo en memoria.
+const GTFS_REFRESH_INTERVAL_MS = 30 * 60 * 1000; // 30 minutos
+const GTFS_VISIBILITY_MIN_MS = 5 * 60 * 1000; // al volver a la pestaña: máx. cada 5 min
+
 // Centro y zoom del mapa: España peninsular.
 const MAP_CENTER = [40.2, -3.7];
 const MAP_ZOOM = 6;
@@ -187,9 +194,11 @@ function initMap() {
  *
  * PRODUCCIÓN (GitHub Pages):
  *   - data/*.json -> GTFS estático preprocesado por GitHub Actions.
- *                    Se cargan UNA vez al abrir la página y quedan en
- *                    memoria (Map con acceso O(1)); jamás se vuelven a
- *                    descargar en cada actualización realtime.
+ *                    Se cargan al abrir la página en índices Map (acceso
+ *                    O(1)) y se refrescan cada 30 min / al volver a la
+ *                    pestaña, NUNCA en cada actualización realtime.
+ *                    La URL lleva ?v=<builtAt>: cada build se cachea por
+ *                    separado y jamás se sirve uno viejo.
  *   - Worker CORS -> los dos feeds GTFS-Realtime de Renfe (cada 15 s).
  *   - El join realtime+estático se hace AQUÍ, en el navegador, y produce
  *     el MISMO objeto "train" que /api/trains de server.js.
@@ -277,18 +286,37 @@ async function fetchJson(url, { timeoutMs = 10000, cache = "no-store" } = {}) {
 }
 
 /**
- * Carga ÚNICA de los JSON estáticos preprocesados (data/*.json).
- * Valida que cada fichero exista y no esté vacío antes de indexarlo.
+ * Carga los JSON estáticos preprocesados (data/*.json).
+ *
+ * Claves de la estrategia (arreglo del "tren sin origen/destino"):
+ *   1. meta.json se pide SIEMPRE con no-store: dice qué build está publicado.
+ *   2. Los JSON grandes van con ?v=<builtAt>: mismo build -> caché; build
+ *      nuevo -> URL nueva y se descarga. `force-cache` solo se usa con la
+ *      versión en la URL, nunca con la URL "pelada" (antes podía servir un
+ *      GTFS de días atrás, porque force-cache ignora la caducidad).
+ *   3. Los índices se construyen aparte y se sustituyen de golpe: si una
+ *      recarga falla a medias, se conserva intacto el GTFS anterior.
  */
 async function cargarDatosEstaticos() {
   const base = DATA_CONFIG.staticBase;
 
-  const [stops, routes, trips, stopTimes, meta] = await Promise.all([
-    fetchJson(`${base}stops.json`, { cache: "force-cache" }),
-    fetchJson(`${base}routes.json`, { cache: "force-cache" }),
-    fetchJson(`${base}trips.json`, { cache: "force-cache" }),
-    fetchJson(`${base}stop_times.json`, { cache: "force-cache" }),
-    fetchJson(`${base}meta.json`, { cache: "force-cache" }),
+  // 1) Versión publicada (fichero diminuto, sin caché).
+  let meta = null;
+  try {
+    meta = await fetchJson(`${base}meta.json`, { cache: "no-store", timeoutMs: 8000 });
+  } catch (error) {
+    console.warn("[datos] meta.json no disponible; se cargan los JSON sin versión.", error);
+  }
+
+  // 2) JSON grandes, versionados por build (o revalidados si no hay meta).
+  const version = meta?.builtAt ? `?v=${encodeURIComponent(meta.builtAt)}` : "";
+  const cacheMode = version ? "force-cache" : "no-cache";
+
+  const [stops, routes, trips, stopTimes] = await Promise.all([
+    fetchJson(`${base}stops.json${version}`, { cache: cacheMode }),
+    fetchJson(`${base}routes.json${version}`, { cache: cacheMode }),
+    fetchJson(`${base}trips.json${version}`, { cache: cacheMode }),
+    fetchJson(`${base}stop_times.json${version}`, { cache: cacheMode }),
   ]);
 
   // Validación: deben ser objetos no vacíos (build correcto de Actions).
@@ -304,12 +332,12 @@ async function cargarDatosEstaticos() {
     }
   }
 
-  for (const [id, nombre] of Object.entries(stops)) gtfs.stopsById.set(id, nombre);
-  for (const [id, servicio] of Object.entries(routes)) gtfs.routesById.set(id, servicio);
-  for (const [id, par] of Object.entries(trips)) gtfs.tripsById.set(id, par);
-  for (const [id, paradas] of Object.entries(stopTimes)) gtfs.stopTimesByTrip.set(id, paradas);
-
-  gtfs.loadedAt = meta?.builtAt ?? null;
+  // Índices nuevos y sustitución atómica (ver comentario de la función).
+  gtfs.stopsById = new Map(Object.entries(stops));
+  gtfs.routesById = new Map(Object.entries(routes));
+  gtfs.tripsById = new Map(Object.entries(trips));
+  gtfs.stopTimesByTrip = new Map(Object.entries(stopTimes));
+  gtfs.loadedAt = meta?.builtAt ?? gtfs.loadedAt;
 
   console.log(
     `[datos] GTFS estático cargado: ${gtfs.stopsById.size} estaciones, ` +
@@ -1183,6 +1211,49 @@ function start() {
   arrancarConDatosEstaticos();
 }
 
+/* --- setInterval para refrescar GTFS cada 30 min (y al volver a pestaña) ---
+   Se incluye al final de arrancarConDatosEstaticos. ---------------------- */
+
+let gtfsRecargando = false;
+let ultimaRecargaGtfsMs = 0;
+
+/**
+ * Vuelve a descargar data/*.json y, si el build cambió, reconstruye los
+ * trenes con el GTFS nuevo. Si falla, se conserva el que ya había.
+ * Evita que un tren de una fecha recién publicada se quede sin
+ * origen/destino por estar mirando un GTFS viejo en memoria.
+ */
+async function recargarDatosEstaticos() {
+  if (gtfsRecargando) return;
+  gtfsRecargando = true;
+
+  const buildAnterior = gtfs.loadedAt;
+  try {
+    await cargarDatosEstaticos();
+    ultimaRecargaGtfsMs = Date.now();
+
+    if (gtfs.loadedAt !== buildAnterior) {
+      console.log(
+        `[datos] GTFS actualizado (${buildAnterior ?? "?"} -> ${gtfs.loadedAt ?? "?"}); ` +
+          "reconstruyendo los trenes con el nuevo recorrido."
+      );
+      updateTrains();
+    }
+  } catch (error) {
+    // No es crítico: los índices anteriores siguen intactos.
+    console.warn("[datos] No se pudo refrescar el GTFS; se mantiene el actual.", error);
+  } finally {
+    gtfsRecargando = false;
+  }
+}
+
+/** Al volver a la pestaña, comprobar si hay un build nuevo (con límite). */
+function comprobarGtfsAlVolver() {
+  if (document.visibilityState !== "visible") return;
+  if (Date.now() - ultimaRecargaGtfsMs < GTFS_VISIBILITY_MIN_MS) return;
+  recargarDatosEstaticos();
+}
+
 /** Carga data/*.json con reintentos; cuando sale, inicia el ciclo de 15 s. */
 async function arrancarConDatosEstaticos() {
   showConnectionStatus("updating");
@@ -1210,6 +1281,11 @@ async function arrancarConDatosEstaticos() {
   // El "hace X" de la última actualización sigue corriendo aunque
   // falle una carga: el ancla solo se mueve con un timestamp nuevo.
   setInterval(refrescarUltimaActualizacion, REFRESH_INTERVAL_MS);
+
+  // Nueva sección: refresco periódico del GTFS estático cada 30 min.
+  // Evita que los trenes de fechas recién publicadas por Renfe se queden
+  // sin origen/destino por tener un GTFS viejo en memoria.
+  setInterval(recargarDatosEstaticos, GTFS_REFRESH_INTERVAL_MS);
 }
 
 /* -----------------------------------------------------------------------
