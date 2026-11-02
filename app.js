@@ -85,7 +85,7 @@ const REFRESH_INTERVAL_MS = 15000; // 15 segundos
 // publica viajes nuevos cada día. Se recarga cada 30 min (y al volver a la
 // pestaña) para que un tren de una fecha nueva no se quede sin origen/destino
 // por estar usando un GTFS viejo en memoria.
-const GTFS_REFRESH_INTERVAL_MS = 30 * 60 * 1000; // 30 minutos
+const GTFS_REFRESH_INTERVAL_MS = 10 * 60 * 1000; // 10 minutos (refresco más frecuente para que los datos nuevos lleguen antes)
 const GTFS_VISIBILITY_MIN_MS = 5 * 60 * 1000; // al volver a la pestaña: máx. cada 5 min
 
 // Centro y zoom del mapa: España peninsular.
@@ -1244,6 +1244,25 @@ async function recargarDatosEstaticos() {
     console.warn("[datos] No se pudo refrescar el GTFS; se mantiene el actual.", error);
   } finally {
     gtfsRecargando = false;
+  }
+
+  // Enviar estadística anónima cada vez que se refresca el GTFS (cada 10 min).
+  // Usamos sendBeacon para que no bloquee la UI ni afecte al tiempo de refresco visual.
+  try {
+    const payload = {
+      tipo: "gtfs_refresh",
+      timestamp: Date.now(),
+      build: gtfs.loadedAt,
+      trenes: currentTrains.length,
+    };
+    const nav = navigator;
+    if (nav && nav.sendBeacon) {
+      const data = JSON.stringify(payload);
+      nav.sendBeacon("https://renfe-live-stats.198cuatro.workers.dev/collect", data);
+    }
+  } catch (e) {
+    // Silencioso: el envío de stats nunca debe romper la app.
+    console.debug("[stats] sendBeacon falló o no disponible", e);
   }
 }
 
