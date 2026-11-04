@@ -227,6 +227,89 @@ function resolveStopName(stopId) {
   return gtfs.stops.get(stopId)?.name ?? null;
 }
 
+/* ------------------------------------------------------------------------
+ * 4b. Hora de llegada "buena": GTFS + delay (arreglo del feed RT de Renfe)
+ *
+ * Espejo de la seccion 4b de app.js. El arrival.time de trip_updates llega
+ * roto (74% de trenes con hora ya pasada); el delay es fiable y el GTFS es
+ * correcto, asi que la hora buena es: hora GTFS + delay. El arrival.time
+ * del RT solo se usa de fallback cuando el GTFS no conoce la parada.
+ * --------------------------------------------------------------------- */
+
+// Delay fuera de estos limites = dato corrupto del feed: se ignora.
+const DELAY_MAXIMO_S = 6 * 3600; // mas de 6 h: imposible
+const DELAY_MINIMO_S = -30 * 60; // mas de 30 min de adelanto: imposible
+
+/** Offset (ms) de Europe/Madrid para un instante epoch (ms). */
+function offsetMadridMs(epochMs) {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Europe/Madrid",
+    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  const partes = {};
+  for (const part of fmt.formatToParts(new Date(epochMs))) partes[part.type] = part.value;
+  const comoUtc = Date.UTC(
+    +partes.year,
+    +partes.month - 1,
+    +partes.day,
+    partes.hour === "24" ? 0 : +partes.hour,
+    +partes.minute,
+    +partes.second
+  );
+  return comoUtc - epochMs;
+}
+
+/**
+ * Hora GTFS local ("HH:MM:SS", puede ser >=24 = dia siguiente) -> epoch
+ * segundos en la fecha de servicio indicada (YYYY-MM-DD, del tripId),
+ * con offset Europe/Madrid (CET/CEST). Devuelve null si falta algun dato.
+ */
+function gtfsHoraAEpoch(horaGtfs, fechaServicio) {
+  if (!horaGtfs || !fechaServicio) return null;
+
+  const m = /^(\d{1,3}):(\d{2})(?::(\d{2}))?$/.exec(String(horaGtfs).trim());
+  const f = /^(\d{4})-(\d{2})-(\d{2})$/.exec(fechaServicio);
+  if (!m || !f) return null;
+
+  let horas = +m[1];
+  const minutos = +m[2];
+  const diasExtra = Math.floor(horas / 24);
+  horas -= diasExtra * 24;
+
+  const naive = Date.UTC(+f[1], +f[2] - 1, +f[3] + diasExtra, horas, minutos, +(m[3] ?? 0));
+  // Dos pasadas por si el instante cae cerca del cambio de hora (DST).
+  const off1 = offsetMadridMs(naive);
+  const cand1 = naive - off1;
+  const off2 = offsetMadridMs(cand1);
+  const epochMs = off2 === off1 ? cand1 : naive - off2;
+  return Math.floor(epochMs / 1000);
+}
+
+/** Delay creible del feed; fuera de rango devuelve null (se ignora). */
+function delayCreible(delay) {
+  const d = Number(delay);
+  if (!Number.isFinite(d) || d > DELAY_MAXIMO_S || d < DELAY_MINIMO_S) return null;
+  return d;
+}
+
+/**
+ * Llegada prevista de una parada: hora GTFS + delay (fiable).
+ * Si el GTFS no conoce la parada, fallback al arrival.time del RT.
+ */
+function llegadaPrevista(horaGtfs, fechaServicio, delay, arrivalRt) {
+  const epochGtfs = gtfsHoraAEpoch(horaGtfs, fechaServicio);
+  if (epochGtfs !== null) {
+    return epochGtfs + (delayCreible(delay) ?? 0);
+  }
+  return arrivalRt?.time ? Number(arrivalRt.time) : null;
+}
+
 /**
  * Combina vehicle_positions + trip_updates + GTFS estatico.
  * Relacion: tripId (vehicle) == tripId (tripUpdate).
@@ -278,20 +361,6 @@ async function buildEnrichedTrains() {
     const destinationStopId =
       scheduledStops.length > 0 ? scheduledStops[scheduledStops.length - 1].stopId : null;
 
-    // Recorrido completo con nombres reales (solo si el GTFS lo conoce).
-    const route = scheduledStops.map((stop) => {
-      const liveUpdate = updateByStopId.get(stop.stopId) ?? null;
-      return {
-        stopId: stop.stopId,
-        name: resolveStopName(stop.stopId),
-        scheduledArrival: stop.arrival || null,
-        liveArrival: liveUpdate?.arrival?.time
-          ? Number(liveUpdate.arrival.time)
-          : null,
-        skipped: skippedStopIds.has(stop.stopId),
-      };
-    });
-
     // --- Proxima parada: el stopId del feed en tiempo real ---
     const currentStopId = vehicle?.stopId ?? null;
     const currentUpdate = currentStopId ? updateByStopId.get(currentStopId) : null;
@@ -304,6 +373,30 @@ async function buildEnrichedTrains() {
         : typeof update?.delay === "number"
           ? update.delay
           : null;
+
+    // Fecha de servicio del viaje (el tripId termina en YYYY-MM-DD):
+    // necesaria para convertir horas GTFS locales a timestamps epoch.
+    const fechaServicio = /(\d{4}-\d{2}-\d{2})$/.exec(tripId)?.[1] ?? null;
+
+    // Recorrido completo con nombres reales (solo si el GTFS lo conoce).
+    const route = scheduledStops.map((stop) => {
+      const liveUpdate = updateByStopId.get(stop.stopId) ?? null;
+      const delayParada =
+        typeof liveUpdate?.arrival?.delay === "number"
+          ? liveUpdate.arrival.delay
+          : delaySeconds;
+      return {
+        stopId: stop.stopId,
+        name: resolveStopName(stop.stopId),
+        scheduledArrival: stop.arrival || null,
+        // Hora "buena": GTFS + delay creible (arrival.time del RT roto;
+        // fallback al RT solo si el GTFS no conoce la parada).
+        liveArrival: liveUpdate?.arrival
+          ? llegadaPrevista(stop.arrival || null, fechaServicio, delayParada, liveUpdate.arrival)
+          : null,
+        skipped: skippedStopIds.has(stop.stopId),
+      };
+    });
 
     trains.push({
       // Identificadores tecnicos (se conservan internamente).
@@ -320,11 +413,20 @@ async function buildEnrichedTrains() {
         ? { stopId: destinationStopId, name: resolveStopName(destinationStopId) }
         : null,
 
-      // Proxima parada y su llegada prevista en tiempo real.
+      // Proxima parada y su llegada prevista: hora GTFS + delay creible
+      // (el arrival.time del RT esta roto; fallback al RT solo si el GTFS
+      // no conoce la parada).
       nextStop: currentStopId
         ? { stopId: currentStopId, name: resolveStopName(currentStopId) }
         : null,
-      nextStopArrival: liveArrival?.time ? Number(liveArrival.time) : null,
+      nextStopArrival: llegadaPrevista(
+        currentStopId
+          ? scheduledStops.find((stop) => stop.stopId === currentStopId)?.arrival ?? null
+          : null,
+        fechaServicio,
+        delaySeconds,
+        liveArrival
+      ),
       delaySeconds,
 
       // Estado y posicion GPS.
